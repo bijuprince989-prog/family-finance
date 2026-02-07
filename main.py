@@ -12,52 +12,95 @@ from sqlalchemy.orm import sessionmaker
 
 app = FastAPI()
 
-# --- 1. 数据库配置 (自动切换) ---
-# 如果是 Render 部署，它会提供 DATABASE_URL 环境变量
+# --- 1. 数据库配置 (针对 Sealos/PostgreSQL 优化) ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if DATABASE_URL:
-    # 兼容 Render 的 postgres:// 前缀 (SQLAlchemy 要求 postgresql://)
+    # 兼容处理：确保前缀是 postgresql://
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    # 连接云端 PostgreSQL
-    engine = create_engine(DATABASE_URL)
+
+    # 连接云端 PostgreSQL，增加 pool_pre_ping 防止连接失效
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_recycle=3600
+    )
+    print("检测到环境变量，正在连接云端 PostgreSQL...")
 else:
-    # 连接本地 SQLite
+    # 连接本地 SQLite (开发调试用)
     engine = create_engine("sqlite:///finance.db", connect_args={"check_same_thread": False})
+    print("未检测到环境变量，正在连接本地 SQLite...")
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
-    with engine.connect() as conn:
-        # 用户表
-        conn.execute(
-            text('CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT)'))
-        # 账本表
-        conn.execute(text('CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY, creator_id INTEGER)'))
-        # 权限表
-        conn.execute(
-            text('CREATE TABLE IF NOT EXISTS memberships (user_id INTEGER, group_id TEXT, UNIQUE(user_id, group_id))'))
-        # 分类表
-        conn.execute(text(
-            'CREATE TABLE IF NOT EXISTS categories (id SERIAL PRIMARY KEY, group_id TEXT, type TEXT, name TEXT, UNIQUE(group_id, type, name))'))
-        # 记录表
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS records (
-            id SERIAL PRIMARY KEY, user_id INTEGER, amount REAL, 
-            type TEXT, category TEXT, note TEXT, time TEXT, group_id TEXT)'''))
-        conn.commit()
+    """
+    初始化数据库表结构。
+    使用 engine.begin() 确保 DDL 语句在事务中执行。
+    """
+    try:
+        with engine.begin() as conn:
+            # 用户表
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY, 
+                    username TEXT UNIQUE, 
+                    password TEXT
+                )'''))
+            # 账本表
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS groups (
+                    group_id TEXT PRIMARY KEY, 
+                    creator_id INTEGER
+                )'''))
+            # 权限表
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS memberships (
+                    user_id INTEGER, 
+                    group_id TEXT, 
+                    UNIQUE(user_id, group_id)
+                )'''))
+            # 分类表
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS categories (
+                    id SERIAL PRIMARY KEY, 
+                    group_id TEXT, 
+                    type TEXT, 
+                    name TEXT, 
+                    UNIQUE(group_id, type, name)
+                )'''))
+            # 记录表
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS records (
+                    id SERIAL PRIMARY KEY, 
+                    user_id INTEGER, 
+                    amount REAL, 
+                    type TEXT, 
+                    category TEXT, 
+                    note TEXT, 
+                    time TEXT, 
+                    group_id TEXT
+                )'''))
+        print("数据库初始化/检查完成。")
+    except Exception as e:
+        # 打印具体错误但不退出程序，防止 Sealos 容器不断重启
+        print(f"数据库初始化警告 (可能是表已存在): {e}")
 
 
+# 在应用启动时尝试初始化
 init_db()
 
 
 # --- 2. 权限校验 ---
 def has_access(username: str, group_id: str):
     with engine.connect() as conn:
-        res = conn.execute(text('''SELECT 1 FROM memberships m JOIN users u ON m.user_id = u.id 
-                                 WHERE u.username = :u AND m.group_id = :g'''),
-                           {"u": username, "g": group_id}).fetchone()
+        res = conn.execute(text('''
+            SELECT 1 FROM memberships m 
+            JOIN users u ON m.user_id = u.id 
+            WHERE u.username = :u AND m.group_id = :g
+        '''), {"u": username, "g": group_id}).fetchone()
         return res is not None
 
 
@@ -81,8 +124,9 @@ def register(user: dict):
             conn.execute(text("INSERT INTO users (username, password) VALUES (:u, :p)"),
                          {"u": user['username'], "p": user['password']})
         return {"message": "成功"}
-    except:
-        raise HTTPException(status_code=400)
+    except Exception as e:
+        print(f"注册失败: {e}")
+        raise HTTPException(status_code=400, detail="注册失败，用户名可能已存在")
 
 
 @app.post("/login")
@@ -90,31 +134,43 @@ def login(user: dict):
     with engine.connect() as conn:
         res = conn.execute(text("SELECT username FROM users WHERE username = :u AND password = :p"),
                            {"u": user['username'], "p": user['password']}).fetchone()
-        if res: return {"status": "success", "username": res[0]}
-    raise HTTPException(status_code=401)
+        if res:
+            return {"status": "success", "username": res[0]}
+    raise HTTPException(status_code=401, detail="用户名或密码错误")
 
 
 @app.post("/create_group")
 def create_group(username: str):
     code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    with engine.begin() as conn:
-        uid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": username}).fetchone()[0]
-        conn.execute(text("INSERT INTO groups (group_id, creator_id) VALUES (:g, :c)"), {"g": code, "c": uid})
-        conn.execute(text("INSERT INTO memberships (user_id, group_id) VALUES (:u, :g)"), {"u": uid, "g": code})
-    return {"invite_code": code}
+    try:
+        with engine.begin() as conn:
+            uid_row = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": username}).fetchone()
+            if not uid_row:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            uid = uid_row[0]
+            conn.execute(text("INSERT INTO groups (group_id, creator_id) VALUES (:g, :c)"), {"g": code, "c": uid})
+            conn.execute(text("INSERT INTO memberships (user_id, group_id) VALUES (:u, :g)"), {"u": uid, "g": code})
+        return {"invite_code": code}
+    except Exception as e:
+        print(f"创建群组失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器内部错误")
 
 
 @app.post("/join_group")
 def join_group(username: str, invite_code: str):
     with engine.begin() as conn:
-        uid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": username}).fetchone()[0]
+        uid_row = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": username}).fetchone()
+        if not uid_row:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        uid = uid_row[0]
         exists = conn.execute(text("SELECT 1 FROM groups WHERE group_id = :g"), {"g": invite_code}).fetchone()
-        if not exists: raise HTTPException(status_code=404)
+        if not exists:
+            raise HTTPException(status_code=404, detail="邀请码无效")
         try:
             conn.execute(text("INSERT INTO memberships (user_id, group_id) VALUES (:u, :g)"),
                          {"u": uid, "g": invite_code})
         except:
-            pass
+            pass  # 如果已经在群组里，忽略错误
     return {"message": "成功"}
 
 
@@ -133,8 +189,9 @@ def search_records(username: str, group_id: Optional[str] = None, year: Optional
     if not group_id or not has_access(username, group_id):
         return {"data": [], "summary": {"income": 0, "expense": 0, "balance": 0}}
 
-    pattern = f"{year if year else ''}-{f'{month:02d}' if month else ''}-{f'{day:02d}' if day else ''}%".strip(
-        "-%") + "%"
+    # 针对 PostgreSQL 的模糊查询优化
+    date_part = f"{year if year else ''}-{f'{month:02d}' if month else ''}-{f'{day:02d}' if day else ''}".strip("-")
+    pattern = f"{date_part}%"
 
     with engine.connect() as conn:
         sql = "SELECT r.*, u.username FROM records r JOIN users u ON r.user_id = u.id WHERE r.group_id = :g AND r.time LIKE :p"
@@ -146,35 +203,31 @@ def search_records(username: str, group_id: Optional[str] = None, year: Optional
 
         df = pd.read_sql_query(text(sql), conn, params=params)
 
-    if df.empty: return {"data": [], "summary": {"income": 0, "expense": 0, "balance": 0}}
+    if df.empty:
+        return {"data": [], "summary": {"income": 0, "expense": 0, "balance": 0}}
+
     inc = df[df['type'] == '收入']['amount'].sum()
     exp = df[df['type'] == '支出']['amount'].sum()
-    return {"data": df.to_dict(orient="records"),
-            "summary": {"income": float(inc), "expense": float(exp), "balance": float(inc - exp)}}
-
-
-@app.get("/get_analytics")
-def get_analytics(username: str, group_id: Optional[str] = None, year: int = 2026, month: int = 2):
-    if not group_id or not has_access(username, group_id): return {"income": [], "expense": []}
-    pattern = f"{year}-{month:02d}%"
-    with engine.connect() as conn:
-        sql = 'SELECT type, category, SUM(amount) as total FROM records WHERE group_id = :g AND time LIKE :p GROUP BY type, category'
-        df = pd.read_sql_query(text(sql), conn, params={"g": group_id, "p": pattern})
-
-    if df.empty: return {"income": [], "expense": []}
-    return {"income": df[df['type'] == '收入'].to_dict(orient="records"),
-            "expense": df[df['type'] == '支出'].to_dict(orient="records")}
+    return {
+        "data": df.to_dict(orient="records"),
+        "summary": {"income": float(inc), "expense": float(exp), "balance": float(inc - exp)}
+    }
 
 
 @app.post("/add_record")
 def add_record(data: AddRecord):
-    if not has_access(data.username, data.group_id): raise HTTPException(status_code=403)
+    if not has_access(data.username, data.group_id):
+        raise HTTPException(status_code=403, detail="无权访问该群组")
     with engine.begin() as conn:
-        uid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": data.username}).fetchone()[0]
-        conn.execute(text(
-            'INSERT INTO records (user_id, amount, type, category, note, time, group_id) VALUES (:u, :a, :t, :c, :n, :tm, :g)'),
-                     {"u": uid, "a": data.amount, "t": data.type, "c": data.category, "n": data.note, "tm": data.time,
-                      "g": data.group_id})
+        uid_row = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": data.username}).fetchone()
+        if not uid_row:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        uid = uid_row[0]
+        conn.execute(text('''
+            INSERT INTO records (user_id, amount, type, category, note, time, group_id) 
+            VALUES (:u, :a, :t, :c, :n, :tm, :g)
+        '''), {"u": uid, "a": data.amount, "t": data.type, "c": data.category,
+               "n": data.note, "tm": data.time, "g": data.group_id})
     return {"message": "成功"}
 
 
@@ -194,7 +247,7 @@ def add_category(group_id: str, type: str, name: str):
             conn.execute(text("INSERT INTO categories (group_id, type, name) VALUES (:g, :t, :n)"),
                          {"g": group_id, "t": type, "n": name})
         except:
-            pass
+            pass  # 唯一约束冲突时不处理
     return {"message": "成功"}
 
 
@@ -219,4 +272,5 @@ def get_records(username: str, group_id: str):
 if __name__ == "__main__":
     import uvicorn
 
+    # 在容器中必须绑定 0.0.0.0
     uvicorn.run(app, host="0.0.0.0", port=8000)
